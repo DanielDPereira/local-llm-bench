@@ -19,22 +19,34 @@ function renderHistory(){
  chart('speedChart','Geração (tokens/s)','tps','tokens/s');chart('ttftChart','TTFT (s)','ttft_s','segundos');
  chart('ramChart','RAM pico (MB)','ram','MB');chart('timeChart','Tempo total (s)','total_s','segundos');
 }
-$('run').onclick=async()=>{
- if(!$('model').value){$('error').textContent='Instale/seleciona um modelo primeiro.';return}
- $('run').disabled=true;$('error').textContent='';$('status').textContent='Benchmark em execução…';$('output').textContent='Aguardando resposta…';
- try{
-  const r=await fetch('/api/benchmark',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:$('model').value,prompt:$('prompt').value,runs:Number($('runs').value),temperature:Number($('temp').value),num_predict:Number($('tokens').value)})});
-  const data=await r.json();if(!r.ok)throw Error(data.detail||'Falha no benchmark');
+function renderBenchmarkResult(data){
   const a=data.averages, samples=data.runs.flatMap(x=>x.hardware),peakRam=Math.max(0,...samples.map(x=>x.ram_used_mb)),peakCpu=Math.max(0,...samples.map(x=>x.cpu_percent)),peakGpu=Math.max(0,...samples.map(x=>x.gpu.utilization_percent||0));
   const tokenAvg=data.runs.reduce((s,x)=>s+x.output_tokens,0)/data.runs.length;
-  const entry={model:data.model,ttft_s:a.ttft_s,tps:a.generation_tokens_per_second,total_s:a.total_time_s,ram:peakRam,cpu:peakCpu,tokens:Math.round(tokenAvg)};
-  history.push(entry);renderHistory();
+  history.push({model:data.model,ttft_s:a.ttft_s,tps:a.generation_tokens_per_second,total_s:a.total_time_s,ram:peakRam,cpu:peakCpu,tokens:Math.round(tokenAvg)});
+  renderHistory();
   $('ttft').textContent=fmt(a.ttft_s,' s');$('tps').textContent=fmt(a.generation_tokens_per_second);$('total').textContent=fmt(a.total_time_s,' s');
   $('ram').textContent=fmt(peakRam,' MB');$('cpu').textContent=fmt(peakCpu,'%');$('gpu').textContent=samples.some(x=>x.gpu.available)?fmt(peakGpu,'%'):'N/D';
   $('outtokens').textContent=Math.round(tokenAvg);$('load').textContent=fmt(a.load_time_s,' s');
-  $('output').textContent=data.runs[0].output||'(Sem texto retornado)';
-  $('status').textContent=`Concluído: ${data.run_count} execução(ões)`;
- }catch(e){$('error').textContent=e.message;$('status').textContent='Benchmark não concluído'}
+}
+$('run').onclick=async()=>{
+  if(!$('model').value){$('error').textContent='Instale/seleciona um modelo primeiro.';return}
+  $('run').disabled=true;$('error').textContent='';$('status').textContent='Benchmark em execução…';$('output').textContent='';
+  try{
+   const response=await fetch('/api/benchmark/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:$('model').value,prompt:$('prompt').value,runs:Number($('runs').value),temperature:Number($('temp').value),num_predict:Number($('tokens').value)})});
+   if(!response.ok||!response.body)throw Error('Falha ao iniciar o streaming do benchmark');
+   const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
+   while(true){
+    const {value,done}=await reader.read();if(done)break;
+    buffer+=decoder.decode(value,{stream:true});
+    const events=buffer.split('\n\n');buffer=events.pop();
+    for(const raw of events){
+     const event=raw.match(/^event: (.+)$/m)?.[1],data=JSON.parse(raw.match(/^data: (.+)$/m)?.[1]||'{}');
+     if(event==='chunk')$('output').textContent+=data.text;
+     if(event==='error')throw Error(data.message||'Falha no benchmark');
+     if(event==='result'){renderBenchmarkResult(data);$('status').textContent=`Concluído: ${data.run_count} execução(ões)`;}
+    }
+   }
+  }catch(e){$('error').textContent=e.message;$('status').textContent='Benchmark não concluído'}
  finally{$('run').disabled=false}
 };
 $('refresh').onclick=loadModels;

@@ -1,13 +1,14 @@
 from __future__ import annotations
 import asyncio, json, os, platform, threading, time
+from queue import Queue
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import psutil
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -62,7 +63,13 @@ def response_chunk(item: dict[str, Any]) -> str:
     return ""
 
 
-def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> dict[str, Any]:
+def run_once(
+    model: str,
+    prompt: str,
+    temperature: float,
+    num_predict: int,
+    on_chunk: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     stop = threading.Event()
     def sampler():
@@ -98,6 +105,8 @@ def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> d
                         if thinking_chunk and first_token_s is None:
                             first_token_s = time.perf_counter() - started
                         thinking += thinking_chunk
+                    if on_chunk and (chunk or thinking_chunk):
+                        on_chunk(chunk or thinking_chunk)
                     if item.get("done"):
                         final = item
     finally:
@@ -125,6 +134,16 @@ def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> d
         },
         "finished_at": datetime.now(timezone.utc).isoformat()
     }
+
+
+def benchmark_result(model: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+    numeric = ["ttft_s", "total_time_s", "generation_tokens_per_second",
+               "wall_tokens_per_second", "prompt_tokens_per_second", "load_time_s"]
+    averages = {k: round(sum(x[k] for x in results if x[k] is not None) /
+                         max(1, sum(1 for x in results if x[k] is not None)), 3)
+                for k in numeric}
+    return {"model": model, "runs": results, "averages": averages,
+            "run_count": len(results)}
 
 @app.get("/")
 def index():
@@ -171,16 +190,66 @@ def benchmark(req: BenchRequest):
         results = []
         for _ in range(req.runs):
             results.append(run_once(req.model, req.prompt, req.temperature, req.num_predict))
-        numeric = ["ttft_s", "total_time_s", "generation_tokens_per_second",
-                   "wall_tokens_per_second", "prompt_tokens_per_second", "load_time_s"]
-        averages = {k: round(sum(x[k] for x in results if x[k] is not None) /
-                             max(1, sum(1 for x in results if x[k] is not None)), 3)
-                    for k in numeric}
-        return {"model": req.model, "runs": results, "averages": averages,
-                "run_count": len(results)}
+        return benchmark_result(req.model, results)
     except httpx.HTTPError as e:
         raise HTTPException(503, f"Falha na comunicação com Ollama: {e}")
     except RuntimeError as e:
         raise HTTPException(502, str(e))
     finally:
         benchmark_lock.release()
+
+
+@app.post("/api/benchmark/stream")
+def benchmark_stream(req: BenchRequest):
+    def events():
+        if not benchmark_lock.acquire(blocking=False):
+            yield f"event: error\ndata: {json.dumps({'message': 'Já existe um benchmark em execução. Aguarde terminar.'}, ensure_ascii=False)}\n\n"
+            return
+
+        messages: Queue[dict[str, Any]] = Queue()
+        try:
+            available = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=10).json().get("models", [])
+            if req.model not in [m.get("name") for m in available]:
+                yield f"event: error\ndata: {json.dumps({'message': f'Modelo {req.model!r} não encontrado no Ollama.'}, ensure_ascii=False)}\n\n"
+                return
+
+            def execute() -> None:
+                try:
+                    results = []
+                    for run_number in range(req.runs):
+                        result = run_once(
+                            req.model,
+                            req.prompt,
+                            req.temperature,
+                            req.num_predict,
+                            on_chunk=lambda chunk: messages.put({
+                                "event": "chunk", "run": run_number + 1, "text": chunk
+                            }),
+                        )
+                        results.append(result)
+                    messages.put({"event": "result", "data": benchmark_result(req.model, results)})
+                except (httpx.HTTPError, RuntimeError) as error:
+                    messages.put({"event": "error", "message": str(error)})
+                finally:
+                    messages.put({"event": "complete"})
+
+            worker = threading.Thread(target=execute, daemon=True)
+            worker.start()
+            while True:
+                message = messages.get()
+                event = message["event"]
+                if event == "chunk":
+                    payload = {"run": message["run"], "text": message["text"]}
+                elif event == "result":
+                    payload = message["data"]
+                else:
+                    payload = {"message": message.get("message", "")}
+                yield f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                if event == "complete":
+                    break
+        except httpx.HTTPError as error:
+            yield f"event: error\ndata: {json.dumps({'message': f'Falha na comunicação com Ollama: {error}'}, ensure_ascii=False)}\n\n"
+        finally:
+            benchmark_lock.release()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
