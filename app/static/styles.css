@@ -9,6 +9,6 @@ button{border:0;border-radius:8px;background:#6c9cff;color:#071323;font-weight:7
 .secondary-button{background:#34445c;color:#e8edf5}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.muted{color:#9eacbf;font-size:13px}.status{margin-left:auto}
 .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}.chart{height:270px}.table-wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:10px;border-bottom:1px solid #2a3546}th{color:#a9b5c6}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0f151e;padding:12px;border-radius:8px;max-height:240px;overflow:auto}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0f151e;padding:12px;border-radius:8px;min-height:115px}
 #error{color:#ff9c9c}.tag{color:#9fc0ff}
 @media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}.fields,.charts{grid-template-columns:1fr}}
