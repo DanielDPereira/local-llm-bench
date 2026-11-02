@@ -52,6 +52,16 @@ def hardware_snapshot() -> dict[str, Any]:
         "gpu": gpu_snapshot()
     }
 
+def response_chunk(item: dict[str, Any]) -> str:
+    response = item.get("response")
+    if isinstance(response, str) and response:
+        return response
+    message = item.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    return ""
+
+
 def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     stop = threading.Event()
@@ -67,6 +77,7 @@ def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> d
     thread.start()
     first_token_s = None
     output = ""
+    thinking = ""
     final: dict[str, Any] = {}
     try:
         with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
@@ -78,10 +89,15 @@ def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> d
                     if not line:
                         continue
                     item = json.loads(line)
-                    chunk = item.get("response", "")
+                    chunk = response_chunk(item)
+                    thinking_chunk = item.get("thinking", "")
                     if chunk and first_token_s is None:
                         first_token_s = time.perf_counter() - started
                     output += chunk
+                    if isinstance(thinking_chunk, str):
+                        if thinking_chunk and first_token_s is None:
+                            first_token_s = time.perf_counter() - started
+                        thinking += thinking_chunk
                     if item.get("done"):
                         final = item
     finally:
@@ -93,7 +109,7 @@ def run_once(model: str, prompt: str, temperature: float, num_predict: int) -> d
     eval_ns = int(final.get("eval_duration", 0))
     prompt_ns = int(final.get("prompt_eval_duration", 0))
     return {
-        "model": model, "output": output,
+        "model": model, "output": output or thinking,
         "ttft_s": round(first_token_s, 3) if first_token_s is not None else None,
         "total_time_s": round(wall, 3),
         "output_tokens": eval_count, "prompt_tokens": prompt_count,
